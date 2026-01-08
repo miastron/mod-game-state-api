@@ -34,6 +34,7 @@ private:
     void HandleServerInfo(const httplib::Request& req, httplib::Response& res);
     void HandleOnlinePlayers(const httplib::Request& req, httplib::Response& res);
     void HandleHealthCheck(const httplib::Request& req, httplib::Response& res);
+    void HandleHostInfo(const httplib::Request& req, httplib::Response& res);
 
     // Utility methods
     void SetCorsHeaders(httplib::Response& res);

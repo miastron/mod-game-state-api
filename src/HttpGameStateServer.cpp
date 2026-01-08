@@ -14,6 +14,16 @@
 #include "GameTime.h"
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/sysinfo.h>
+#include <unistd.h>
+#include <fstream>
+#include <sstream>
+#endif
+
 using json = nlohmann::json;
 
 HttpGameStateServer::HttpGameStateServer(const std::string& host, uint16 port, const std::string& allowedOrigin)
@@ -40,6 +50,10 @@ HttpGameStateServer::HttpGameStateServer(const std::string& host, uint16 port, c
 
     _server->Get("/api/server", [this](const httplib::Request& req, httplib::Response& res) {
         HandleServerInfo(req, res);
+    });
+
+    _server->Get("/api/host", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleHostInfo(req, res);
     });
 
     _server->Get("/api/players", [this](const httplib::Request& req, httplib::Response& res) {
@@ -159,6 +173,149 @@ void HttpGameStateServer::HandleHealthCheck(const httplib::Request& /*req*/, htt
     };
 
     SendJsonResponse(res, response.dump(2));
+}
+
+void HttpGameStateServer::HandleHostInfo(const httplib::Request& /*req*/, httplib::Response& res)
+{
+    // Static variables to track peak values since server start
+    static double peakCpuUsage = 0.0;
+    static uint64_t peakMemUsage = 0;
+
+    try
+    {
+        json response;
+        double currentCpuUsage = 0.0;
+        uint64_t currentMemUsage = 0;
+
+#ifdef _WIN32
+        // Windows implementation
+
+        // Host uptime
+        ULONGLONG uptimeMs = GetTickCount64();
+        response["uptime_seconds"] = uptimeMs / 1000;
+
+        // Get current CPU usage using GetSystemTimes
+        FILETIME idleTime, kernelTime, userTime;
+        static FILETIME prevIdleTime = {0}, prevKernelTime = {0}, prevUserTime = {0};
+        static bool firstCall = true;
+
+        if (GetSystemTimes(&idleTime, &kernelTime, &userTime))
+        {
+            if (firstCall)
+            {
+                prevIdleTime = idleTime;
+                prevKernelTime = kernelTime;
+                prevUserTime = userTime;
+                firstCall = false;
+                currentCpuUsage = 0.0;
+            }
+            else
+            {
+                ULONGLONG idle = (((ULONGLONG)idleTime.dwHighDateTime << 32) | idleTime.dwLowDateTime) -
+                                 (((ULONGLONG)prevIdleTime.dwHighDateTime << 32) | prevIdleTime.dwLowDateTime);
+                ULONGLONG kernel = (((ULONGLONG)kernelTime.dwHighDateTime << 32) | kernelTime.dwLowDateTime) -
+                                   (((ULONGLONG)prevKernelTime.dwHighDateTime << 32) | prevKernelTime.dwLowDateTime);
+                ULONGLONG user = (((ULONGLONG)userTime.dwHighDateTime << 32) | userTime.dwLowDateTime) -
+                                 (((ULONGLONG)prevUserTime.dwHighDateTime << 32) | prevUserTime.dwLowDateTime);
+
+                ULONGLONG total = kernel + user;
+                currentCpuUsage = (total > 0) ? (1.0 - ((double)idle / (double)total)) * 100.0 : 0.0;
+                currentCpuUsage = std::round(currentCpuUsage * 100.0) / 100.0;
+
+                prevIdleTime = idleTime;
+                prevKernelTime = kernelTime;
+                prevUserTime = userTime;
+            }
+        }
+
+        // Memory information
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        if (GlobalMemoryStatusEx(&memInfo))
+        {
+            currentMemUsage = memInfo.ullTotalPhys - memInfo.ullAvailPhys;
+        }
+
+#else
+        // Linux implementation
+
+        // Host uptime and memory
+        struct sysinfo si;
+        if (sysinfo(&si) == 0)
+        {
+            response["uptime_seconds"] = si.uptime;
+            currentMemUsage = (si.totalram - si.freeram - si.bufferram) * si.mem_unit;
+        }
+        else
+        {
+            response["uptime_seconds"] = 0;
+        }
+
+        // CPU usage from /proc/stat
+        static unsigned long long prevTotal = 0, prevIdle = 0;
+        static bool firstCall = true;
+
+        std::ifstream statFile("/proc/stat");
+        if (statFile.is_open())
+        {
+            std::string line;
+            std::getline(statFile, line);
+            statFile.close();
+
+            unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+            if (sscanf(line.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                       &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) >= 4)
+            {
+                unsigned long long totalIdle = idle + iowait;
+                unsigned long long total = user + nice + system + idle + iowait + irq + softirq + steal;
+
+                if (firstCall)
+                {
+                    prevTotal = total;
+                    prevIdle = totalIdle;
+                    firstCall = false;
+                    currentCpuUsage = 0.0;
+                }
+                else
+                {
+                    unsigned long long totalDiff = total - prevTotal;
+                    unsigned long long idleDiff = totalIdle - prevIdle;
+
+                    currentCpuUsage = (totalDiff > 0) ? (1.0 - ((double)idleDiff / (double)totalDiff)) * 100.0 : 0.0;
+                    currentCpuUsage = std::round(currentCpuUsage * 100.0) / 100.0;
+
+                    prevTotal = total;
+                    prevIdle = totalIdle;
+                }
+            }
+        }
+#endif
+
+        // Update peak values
+        if (currentCpuUsage > peakCpuUsage)
+        {
+            peakCpuUsage = currentCpuUsage;
+        }
+        if (currentMemUsage > peakMemUsage)
+        {
+            peakMemUsage = currentMemUsage;
+        }
+
+        // Build response
+        response["current_cpu"] = currentCpuUsage;
+        response["max_cpu"] = peakCpuUsage;
+        response["current_mem"] = currentMemUsage;
+        response["max_mem"] = peakMemUsage;
+
+        response["timestamp"] = std::time(nullptr);
+        SendJsonResponse(res, response.dump(2));
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR("module.gamestate_api", "Error getting host info: {}", e.what());
+        json error = {{"error", "Internal server error"}, {"status", 500}};
+        SendJsonResponse(res, error.dump(2), 500);
+    }
 }
 
 void HttpGameStateServer::HandleServerInfo(const httplib::Request& /*req*/, httplib::Response& res)
