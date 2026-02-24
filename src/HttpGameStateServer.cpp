@@ -239,16 +239,78 @@ void HttpGameStateServer::HandleHostInfo(const httplib::Request& /*req*/, httpli
 #else
         // Linux implementation
 
-        // Host uptime and memory
+        // Host uptime
         struct sysinfo si;
         if (sysinfo(&si) == 0)
         {
             response["uptime_seconds"] = si.uptime;
-            currentMemUsage = (si.totalram - si.freeram - si.bufferram) * si.mem_unit;
         }
         else
         {
             response["uptime_seconds"] = 0;
+        }
+
+        // Memory usage - prefer cgroup limits (container-aware)
+        {
+            unsigned long long memLimit = 0;
+            unsigned long long memUsage = 0;
+            bool cgroupFound = false;
+
+            // Try cgroup v2 first
+            std::ifstream cgMaxFile("/sys/fs/cgroup/memory.max");
+            std::ifstream cgCurFile("/sys/fs/cgroup/memory.current");
+            if (cgMaxFile.is_open() && cgCurFile.is_open())
+            {
+                std::string maxStr, curStr;
+                std::getline(cgMaxFile, maxStr);
+                std::getline(cgCurFile, curStr);
+                cgMaxFile.close();
+                cgCurFile.close();
+
+                if (maxStr != "max")
+                {
+                    memLimit = std::stoull(maxStr);
+                    memUsage = std::stoull(curStr);
+                    cgroupFound = true;
+                }
+            }
+
+            // Try cgroup v1 if v2 wasn't available
+            if (!cgroupFound)
+            {
+                std::ifstream cgLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+                std::ifstream cgUsageFile("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+                if (cgLimitFile.is_open() && cgUsageFile.is_open())
+                {
+                    unsigned long long limit, usage;
+                    cgLimitFile >> limit;
+                    cgUsageFile >> usage;
+                    cgLimitFile.close();
+                    cgUsageFile.close();
+
+                    // cgroup v1 reports a very large number when unlimited
+                    unsigned long long totalPhys = si.totalram * si.mem_unit;
+                    if (limit < totalPhys)
+                    {
+                        memLimit = limit;
+                        memUsage = usage;
+                        cgroupFound = true;
+                    }
+                }
+            }
+
+            if (cgroupFound)
+            {
+                response["total_mem"] = memLimit;
+                currentMemUsage = memUsage;
+            }
+            else
+            {
+                // Fallback to sysinfo if not in a container
+                unsigned long long totalPhys = si.totalram * si.mem_unit;
+                response["total_mem"] = totalPhys;
+                currentMemUsage = (si.totalram - si.freeram - si.bufferram) * si.mem_unit;
+            }
         }
 
         // CPU usage from /proc/stat
